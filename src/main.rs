@@ -18,6 +18,7 @@ mod filter;
 mod find_cmd;
 mod format_cmd;
 mod gain;
+mod gcc_cmd;
 mod gh_cmd;
 mod git;
 mod go_cmd;
@@ -664,6 +665,21 @@ enum Commands {
     #[command(name = "golangci-lint")]
     GolangciLint {
         /// golangci-lint arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// gcc/g++ compiler with grouped error output (60-80% token savings)
+    ///
+    /// Strips verbose caret/source-snippet context lines and groups
+    /// diagnostics by file.  Errors show file + line + message; warnings
+    /// are summarised by file.  Works with gcc, g++, and clang.
+    Gcc {
+        /// Compiler binary to invoke (gcc, g++, clang, clang++)
+        #[arg(default_value = "gcc")]
+        compiler: String,
+
+        /// Compiler arguments (source files, flags, …)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -2033,6 +2049,10 @@ fn main() -> Result<()> {
             golangci_cmd::run(&args, cli.verbose)?;
         }
 
+        Commands::Gcc { compiler, args } => {
+            gcc_cmd::run(&compiler, &args, cli.verbose)?;
+        }
+
         Commands::HookAudit { since } => {
             hook_audit_cmd::run(since, cli.verbose)?;
         }
@@ -2249,6 +2269,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Go { .. }
             | Commands::GolangciLint { .. }
             | Commands::Gt { .. }
+            | Commands::Gcc { .. }
     )
 }
 
