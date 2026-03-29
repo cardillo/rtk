@@ -101,6 +101,9 @@ struct TomlFilterDef {
     tail_lines: Option<usize>,
     max_lines: Option<usize>,
     on_empty: Option<String>,
+    /// Extra args to inject before user-supplied args when executing the command.
+    #[serde(default)]
+    extra_args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +147,7 @@ pub struct CompiledFilter {
     tail_lines: Option<usize>,
     pub max_lines: Option<usize>,
     on_empty: Option<String>,
+    pub extra_args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +393,7 @@ fn compile_filter(name: String, def: TomlFilterDef) -> Result<CompiledFilter, St
         tail_lines: def.tail_lines,
         max_lines: def.max_lines,
         on_empty: def.on_empty,
+        extra_args: def.extra_args,
     })
 }
 

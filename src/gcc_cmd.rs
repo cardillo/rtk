@@ -31,7 +31,7 @@ pub fn run(compiler: &str, args: &[String], verbose: u8) -> Result<()> {
 
     timer.track(
         &format!("{} {}", compiler, args.join(" ")),
-        &format!("rtk {} {}", compiler, args.join(" ")),
+        &format!("rtk {}", compiler),
         &raw,
         &filtered,
     );
@@ -59,7 +59,6 @@ impl Severity {
             _ => None,
         }
     }
-
 }
 
 struct GccDiagnostic {
