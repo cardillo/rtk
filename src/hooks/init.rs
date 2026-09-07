@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+use crate::core::utils::{from_json_str, strip_leading_bom};
 use crate::hooks::constants::{
     CONFIG_DIR, COPILOT_HOME_ENV, COPILOT_HOOK_FILE, COPILOT_INSTRUCTIONS_FILE, COPILOT_USER_DIR,
     CURSOR_DIR, GEMINI_DIR, GITHUB_DIR, OPENCODE_PLUGIN_FILE, OPENCODE_SUBDIR, PLUGIN_SUBDIR,
@@ -17,8 +18,10 @@ use super::constants::{
     DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
     DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
     HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR,
-    PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    HOOKS_SUBDIR, OMP_DIR, OMP_LOCAL_DIR, PI_AGENT_STATE_FILE, PI_CODING_AGENT_DIR_ENV, PI_DIR,
+    PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
+    VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
 };
 use super::integrity;
 use super::is_claude_hook_command;
@@ -28,6 +31,82 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 
 // Embedded Pi extension (auto-rewrite)
 const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
+
+// Stable code marker used to recognize a modified RTK extension without
+// relying on explanatory comments that users may remove. The marker matches
+// both the current `pi.exec` call and older stock revisions that imported
+// `exec` locally before invoking it.
+const PI_PLUGIN_REWRITE_MARKER: &str = "exec(\"rtk\", [\"rewrite\"";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiCompatibleAgent {
+    Pi,
+    Omp,
+}
+
+enum ManagedAgentState {
+    Absent,
+    Known(Vec<PiCompatibleAgent>),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionShareStatus {
+    NotShared,
+    Shared,
+    Unknown,
+}
+
+impl PiCompatibleAgent {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pi => "Pi",
+            Self::Omp => "OMP",
+        }
+    }
+
+    fn state_name(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Pi => Self::Omp,
+            Self::Omp => Self::Pi,
+        }
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "pi" => Some(Self::Pi),
+            "omp" => Some(Self::Omp),
+            _ => None,
+        }
+    }
+}
+
+// SHA-256 hashes of stock Pi extension revisions that may exist on user
+// machines, including the current embedded file. Keep historical entries
+// when changing the extension so an untouched older install can still be
+// removed safely. Hashes are computed after normalizing CRLF to LF and
+// trimming trailing whitespace, matching the comparisons below.
+// The history-based test below verifies that this list remains append-only
+// for every revision in the current checkout's ancestor history.
+const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
+    "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
+    "2cbb2a7a9081275d6eda140d9e375f6772b5c354e7fe931c554c371ad8836c6e",
+    "94e80d1a5c159ea38ba8913f7c5b9d9b5c89bf7c204f1e583bfac2ed7fc40ab9",
+    "b63e3f6eeaeec23837df5a7c4024fe16dca1f8a49fb1743f8a877cc136ebc2d9",
+    "c30d4f4774c59bf25b50b70ab8a7dcb1b8287074592af1598dc09962fa1c7137",
+    "5ad230679294dc8dce09546fa25101fd3d0949f454cc8b72e04664fa1bd45ed7",
+    "be251e44747e6d09e5ca56ecaeddd8f4861c35a57500cd8b2bf9c39afe5795e8",
+    "eb56dd08b8d5f4704906d037d70b357d84d827abe1063135cc7c998efe6cf7f2",
+    "628308173ae41c488b76bcf90eafbd4c0c72435927645d81cdbec652eac4b107",
+    "3eb16108f51a29c2a62a453d5c97a6ea2da8aea1061da34c50fdcfaa32dc0ff7",
+];
 
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
@@ -338,6 +417,22 @@ pub fn run(
 
     if !dry_run {
         prompt_telemetry_consent()?;
+        // Best-effort: unconditionally re-run tracking-DB schema migrations during
+        // install/upgrade (bypassing the `user_version` gate `Tracker::new()` uses
+        // on its hot path). This both pre-warms the schema so the first PreToolUse
+        // hook invocation (or `rtk <cmd>`) after this doesn't pay the one-time
+        // migration cost itself, and self-heals a table dropped/corrupted
+        // out-of-band (see `tracking::warn_if_missing_table`) — `rtk init` is
+        // already the natural "something's wrong, reinstall" move, so no separate
+        // repair flag is needed. `CREATE TABLE IF NOT EXISTS`/`ALTER TABLE` are
+        // additive, so existing history is left untouched. Never fail `rtk init`
+        // over a tracking-DB hiccup — but still tell the user something's wrong,
+        // consistent with every other best-effort warning in this function
+        // (rust-patterns.md's anti-pattern rule: a silent `Err(_) => {}` leaves
+        // the user with zero indication anything went wrong).
+        if let Err(e) = crate::core::tracking::ensure_schema_fresh() {
+            eprintln!("  [warn] Failed to prepare tracking database: {e}");
+        }
     }
 
     if dry_run {
@@ -352,10 +447,53 @@ pub fn run(
 /// Idempotent file write: create or update if content differs.
 /// When `dry_run` is true, prints the intended action and does not touch the filesystem.
 fn write_if_changed(path: &Path, content: &str, name: &str, ctx: InitContext) -> Result<bool> {
+    write_if_changed_internal(path, content, name, ctx, false)
+}
+
+/// Variant used for protected RTK files. A file that cannot be decoded is
+/// still replaceable after the caller's policy allows it (for example,
+/// `--auto-patch`), so a read error is treated like differing content instead
+/// of preventing recovery.
+fn write_if_changed_allow_read_error(
+    path: &Path,
+    content: &str,
+    name: &str,
+    ctx: InitContext,
+) -> Result<bool> {
+    write_if_changed_internal(path, content, name, ctx, true)
+}
+
+fn write_if_changed_internal(
+    path: &Path,
+    content: &str,
+    name: &str,
+    ctx: InitContext,
+    allow_read_error: bool,
+) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
     if path.exists() {
-        let existing = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}: {}", name, path.display()))?;
+        let existing = match fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(_) if allow_read_error => {
+                if dry_run {
+                    println!("[dry-run] would update {}: {}", name, path.display());
+                    if verbose > 0 {
+                        println!("[dry-run] content:\n{}", content);
+                    }
+                } else {
+                    atomic_write(path, content)
+                        .with_context(|| format!("Failed to write {}: {}", name, path.display()))?;
+                    if verbose > 0 {
+                        eprintln!("Updated {}: {}", name, path.display());
+                    }
+                }
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read {}: {}", name, path.display()));
+            }
+        };
 
         if existing == content {
             if verbose > 0 {
@@ -432,17 +570,18 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt user for consent to patch settings.json
-/// Prints to stderr (stdout may be piped), reads from stdin
-/// Default is No (capital N)
-fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
+/// Prompt user for confirmation.
+/// Prints to stderr (stdout may be piped), reads from stdin, and defaults to
+/// No in non-interactive environments.
+fn prompt_user_confirmation(prompt: &str) -> Result<bool> {
     use std::io::{self, BufRead, IsTerminal};
 
-    eprintln!("\nPatch existing {}? [y/N] ", settings_path.display());
+    eprint!("\n{} [y/N] ", prompt);
+    io::stderr().flush().context("Failed to flush prompt")?;
 
-    // If stdin is not a terminal (piped), default to No
+    // If stdin is not a terminal (piped), default to No.
     if !io::stdin().is_terminal() {
-        eprintln!("(non-interactive mode, defaulting to N)");
+        eprintln!("\n(non-interactive mode, defaulting to N)");
         return Ok(false);
     }
 
@@ -455,6 +594,11 @@ fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
 
     let response = line.trim().to_lowercase();
     Ok(response == "y" || response == "yes")
+}
+
+/// Prompt user for consent to patch settings.json.
+fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
+    prompt_user_confirmation(&format!("Patch existing {}?", settings_path.display()))
 }
 
 pub fn save_telemetry_consent(accepted: bool) -> Result<()> {
@@ -475,6 +619,16 @@ fn prompt_telemetry_consent() -> Result<()> {
         Some(true) => return Ok(()),
         Some(false) => return Ok(()),
         None => {}
+    }
+
+    // Explicit opt-out must short-circuit before the TTY heuristic: some
+    // non-interactive environments (devcontainer `postCreateCommand`, certain
+    // CI agents) hand rtk a pseudo-TTY, so `is_terminal()` returns true even
+    // though no human is available to answer — the prompt then hangs forever.
+    // Setting `RTK_TELEMETRY_DISABLED=1` is the documented workaround, so the
+    // init prompt has to honour it too, not only `telemetry::maybe_ping`.
+    if crate::core::telemetry_cmd::telemetry_disabled_by_env() {
+        return Ok(());
     }
 
     if !io::stdin().is_terminal() {
@@ -585,12 +739,13 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
 
     let content = fs::read_to_string(&settings_path)
         .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+    let content = strip_leading_bom(&content);
 
     if content.trim().is_empty() {
         return Ok(false);
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(&content)
+    let mut root: serde_json::Value = from_json_str(content)
         .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?;
 
     let removed = remove_hook_from_json(&mut root);
@@ -627,13 +782,31 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall for Claude, Gemini, Codex, Cursor, or Pi artifacts.
+/// Full uninstall for Claude, Gemini, Codex, Cursor, Pi, or OMP artifacts.
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn uninstall(
     global: bool,
     gemini: bool,
     codex: bool,
     cursor: bool,
     pi: bool,
+    omp: bool,
+    ctx: InitContext,
+) -> Result<()> {
+    uninstall_with_patch_mode(global, gemini, codex, cursor, pi, omp, PatchMode::Ask, ctx)
+}
+
+/// Full uninstall with an explicit confirmation policy for managed
+/// Pi-compatible extensions.
+#[allow(clippy::too_many_arguments)]
+pub fn uninstall_with_patch_mode(
+    global: bool,
+    gemini: bool,
+    codex: bool,
+    cursor: bool,
+    pi: bool,
+    omp: bool,
+    patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
@@ -673,7 +846,12 @@ pub fn uninstall(
     }
 
     if pi {
-        uninstall_pi(global, ctx)?;
+        uninstall_pi_with_patch_mode(global, patch_mode, ctx)?;
+        return Ok(());
+    }
+
+    if omp {
+        uninstall_omp_with_patch_mode(global, patch_mode, ctx)?;
         return Ok(());
     }
 
@@ -955,11 +1133,12 @@ fn patch_settings_json_command(
     let mut root = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+        let content = strip_leading_bom(&content);
 
         if content.trim().is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(&content)
+            from_json_str(content)
                 .with_context(|| format!("Failed to parse {} as JSON", settings_path.display()))?
         }
     } else {
@@ -1293,11 +1472,12 @@ fn remove_legacy_settings_entries(ctx: InitContext) -> Result<()> {
 
     let content = fs::read_to_string(&settings_path)
         .with_context(|| format!("Failed to read {}", settings_path.display()))?;
+    let content = strip_leading_bom(&content);
     if content.trim().is_empty() {
         return Ok(());
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(&content)
+    let mut root: serde_json::Value = from_json_str(content)
         .with_context(|| format!("Failed to parse {}", settings_path.display()))?;
 
     if !remove_legacy_hook_entries_from_json(&mut root) {
@@ -2947,10 +3127,11 @@ fn read_droid_json(path: &Path) -> Result<Option<serde_json::Value>> {
     }
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = strip_leading_bom(&content);
     if content.trim().is_empty() {
         return Ok(Some(serde_json::json!({})));
     }
-    serde_json::from_str(&content)
+    from_json_str(content)
         .map(Some)
         .with_context(|| format!("Failed to parse {} as JSON", path.display()))
 }
@@ -3384,9 +3565,100 @@ fn pi_plugin_path_for_scope(global: bool) -> Result<PathBuf> {
     }
 }
 
-/// Write the Pi extension file if missing or outdated. Returns true if written.
-fn ensure_pi_plugin_installed(path: &Path, ctx: InitContext) -> Result<bool> {
-    write_if_changed(path, PI_PLUGIN, "Pi extension", ctx)
+/// Check whether a managed Pi-compatible extension can be installed.
+///
+/// Returns `false` when the selected policy declines or previews a skipped
+/// action; `--auto-patch --dry-run` returns `true` so the caller can preview
+/// the same directory and write actions as a real auto-patch. Validation runs
+/// before parent directory creation.
+fn validate_stock_pi_plugin_path(
+    path: &Path,
+    name: &str,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<bool> {
+    if path.exists() {
+        let is_known_stock = match fs::read_to_string(path) {
+            Ok(existing) => is_known_stock_pi_plugin(&existing),
+            Err(error) => {
+                eprintln!(
+                    "[warn] {} at {} could not be read; treating it as non-stock: {}",
+                    name,
+                    path.display(),
+                    error
+                );
+                false
+            }
+        };
+        if !is_known_stock {
+            if ctx.dry_run {
+                return match patch_mode {
+                    PatchMode::Ask => {
+                        println!(
+                            "[dry-run] would prompt before overwriting {}: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                    PatchMode::Auto => {
+                        println!(
+                            "[dry-run] would overwrite non-stock {}: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(true)
+                    }
+                    PatchMode::Skip => {
+                        println!(
+                            "[dry-run] would leave {} unchanged: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                };
+            }
+
+            let should_overwrite = match patch_mode {
+                PatchMode::Auto => true,
+                PatchMode::Skip => false,
+                PatchMode::Ask => {
+                    let prompt = format!("Overwrite the non-stock {} at {}?", name, path.display());
+                    prompt_user_confirmation(&prompt)?
+                }
+            };
+
+            return Ok(should_overwrite);
+        }
+    }
+
+    Ok(true)
+}
+
+fn normalize_pi_plugin_line_endings(content: &str) -> String {
+    content.replace("\r\n", "\n")
+}
+
+fn is_current_pi_plugin(content: &str) -> bool {
+    normalize_pi_plugin_line_endings(content).trim_end()
+        == normalize_pi_plugin_line_endings(PI_PLUGIN).trim_end()
+}
+
+fn looks_like_rtk_pi_plugin(content: &str) -> bool {
+    content.contains(PI_PLUGIN_REWRITE_MARKER)
+}
+
+fn is_known_stock_pi_plugin(content: &str) -> bool {
+    if is_current_pi_plugin(content) {
+        return true;
+    }
+
+    let normalized = normalize_pi_plugin_line_endings(content);
+    let hash = integrity::compute_hash_bytes(normalized.trim_end().as_bytes());
+    KNOWN_PI_PLUGIN_HASHES
+        .iter()
+        .any(|expected| *expected == hash)
 }
 
 /// Create the Pi extensions directory, or in dry-run mode, print a message only if
@@ -3404,42 +3676,422 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
     Ok(())
 }
 
-/// Uninstall Pi extension for the given scope.
-/// Mirrors `uninstall_codex` / `uninstall_hermes`: extracted from the dispatcher
-/// so it can be tested and reasoned about independently.
-fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
-    let InitContext { verbose, dry_run } = ctx;
-    let plugin_path = pi_plugin_path_for_scope(global)?;
-    let mut removed: Vec<String> = Vec::new();
+/// Check whether the Pi and OMP extension paths for the selected scope resolve
+/// to the same target.
+fn extension_paths_alias(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
+    let other_path = match agent {
+        PiCompatibleAgent::Pi => omp_extension_path_for_scope(global)?,
+        PiCompatibleAgent::Omp => pi_plugin_path_for_scope(global)?,
+    };
 
-    if plugin_path.exists() {
-        if dry_run {
-            println!(
-                "[dry-run] would remove Pi extension: {}",
-                plugin_path.display()
-            );
-        } else {
-            // nosemgrep: filesystem-deletion -- Pi uninstall removes only the RTK-managed extension file.
-            fs::remove_file(&plugin_path).with_context(|| {
-                format!("Failed to remove Pi extension: {}", plugin_path.display())
-            })?;
-            if verbose > 0 {
-                eprintln!("Removed Pi extension: {}", plugin_path.display());
+    Ok(canonicalize_path_for_comparison(path) == canonicalize_path_for_comparison(&other_path))
+}
+
+/// Canonicalize an extension path even when its final file has not been
+/// created yet. This detects agent directories connected by symlinks while
+/// retaining a literal-path fallback for genuinely unresolved paths.
+fn canonicalize_path_for_comparison(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut missing_components = Vec::new();
+    let mut candidate = path;
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(candidate) {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
             }
-            removed.push(format!("Pi extension: {}", plugin_path.display()));
+            return canonical;
+        }
+
+        let Some(file_name) = candidate.file_name() else {
+            return path.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+
+        let Some(parent) = candidate.parent() else {
+            return path.to_path_buf();
+        };
+        if parent == candidate {
+            return path.to_path_buf();
+        }
+        candidate = parent;
+    }
+}
+
+fn shared_agent_state_path(path: &Path) -> PathBuf {
+    canonicalize_path_for_comparison(path).with_file_name(PI_AGENT_STATE_FILE)
+}
+
+fn read_managed_agents(path: &Path) -> Result<ManagedAgentState> {
+    let state_path = shared_agent_state_path(path);
+    let content = match fs::read_to_string(&state_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ManagedAgentState::Absent);
+        }
+        Err(error) => {
+            eprintln!(
+                "[warn] RTK extension ownership state at {} could not be read; treating ownership as unknown: {}",
+                state_path.display(),
+                error
+            );
+            return Ok(ManagedAgentState::Unknown);
+        }
+    };
+    let mut agents = Vec::new();
+    let mut has_invalid_entry = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match PiCompatibleAgent::from_state_name(line) {
+            Some(agent) => {
+                if !agents.contains(&agent) {
+                    agents.push(agent);
+                }
+            }
+            None => has_invalid_entry = true,
         }
     }
 
-    if dry_run {
-        print_dry_run_footer();
-    } else if !removed.is_empty() {
-        println!("RTK uninstalled (Pi):");
-        for item in &removed {
-            println!("  - {}", item);
-        }
-        println!("\nRestart pi to apply changes.");
+    if has_invalid_entry {
+        eprintln!(
+            "[warn] RTK extension ownership state at {} contains unknown entries; treating ownership as unknown",
+            state_path.display()
+        );
+        return Ok(ManagedAgentState::Unknown);
+    }
+
+    if agents.is_empty() {
+        eprintln!(
+            "[warn] RTK extension ownership state at {} is empty; treating ownership as unknown",
+            state_path.display()
+        );
+        return Ok(ManagedAgentState::Unknown);
+    }
+
+    Ok(ManagedAgentState::Known(agents))
+}
+
+fn record_managed_agent(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+    extension_was_present: bool,
+    ctx: InitContext,
+) -> Result<()> {
+    if !extension_paths_alias(global, path, agent)? {
+        return Ok(());
+    }
+
+    let state_path = shared_agent_state_path(path);
+    let mut agents = if !extension_was_present {
+        // If the extension was absent before this install, any remaining
+        // sidecar describes a file that no longer exists and must not be
+        // carried into the new installation.
+        Vec::new()
     } else {
-        println!("RTK Pi extension was not installed (nothing to remove)");
+        match read_managed_agents(path)? {
+            ManagedAgentState::Absent => {
+                eprintln!(
+                    "[warn] RTK extension ownership state at {} could not be established because this pre-existing extension has no ownership record; preserving the absent state and proceeding without recording {}",
+                    state_path.display(),
+                    agent.state_name()
+                );
+                return Ok(());
+            }
+            ManagedAgentState::Known(agents) => agents,
+            ManagedAgentState::Unknown => {
+                // Do not turn unknown ownership into a current-agent-only
+                // record. The extension was installed successfully, but the
+                // existing state must remain intact for the fallback path.
+                eprintln!(
+                    "[warn] RTK extension ownership state at {} could not be updated because ownership is unknown; preserving it and proceeding without recording {}",
+                    state_path.display(),
+                    agent.state_name()
+                );
+                return Ok(());
+            }
+        }
+    };
+    if !agents.contains(&agent) {
+        agents.push(agent);
+    }
+    agents.sort_by_key(|agent| agent.state_name());
+    let content = format!(
+        "{}\n",
+        agents
+            .iter()
+            .map(|agent| agent.state_name())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    write_if_changed_allow_read_error(&state_path, &content, "RTK extension ownership state", ctx)?;
+    Ok(())
+}
+
+fn remove_managed_agent_state(state_path: &Path, ctx: InitContext) -> Result<()> {
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    if ctx.dry_run {
+        println!(
+            "[dry-run] would remove RTK extension ownership state: {}",
+            state_path.display()
+        );
+    } else {
+        // nosemgrep: filesystem-deletion -- state belongs exclusively to the RTK-managed extension.
+        fs::remove_file(state_path).with_context(|| {
+            format!(
+                "Failed to remove RTK extension ownership state: {}",
+                state_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Determine whether a Pi-compatible extension path is shared by both agents,
+/// distinguishing definitive sidecar ownership from unavailable information.
+///
+/// The ownership sidecar records which agents RTK installed for a relocated
+/// shared path. A missing sidecar is treated as uncertain because the
+/// extension may predate RTK's ownership tracking.
+fn extension_share_status(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+) -> Result<ExtensionShareStatus> {
+    if !extension_paths_alias(global, path, agent)? {
+        return Ok(ExtensionShareStatus::NotShared);
+    }
+
+    let other_agent = agent.other();
+    match read_managed_agents(path)? {
+        ManagedAgentState::Known(agents) => {
+            if agents.contains(&other_agent) {
+                Ok(ExtensionShareStatus::Shared)
+            } else {
+                Ok(ExtensionShareStatus::NotShared)
+            }
+        }
+        ManagedAgentState::Absent | ManagedAgentState::Unknown => Ok(ExtensionShareStatus::Unknown),
+    }
+}
+
+fn extension_scope_name(global: bool) -> &'static str {
+    if global {
+        "global"
+    } else {
+        "project"
+    }
+}
+
+fn warn_if_extension_shared_on_install(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+) -> Result<()> {
+    let scope = extension_scope_name(global);
+    match extension_share_status(global, path, agent)? {
+        ExtensionShareStatus::NotShared => {}
+        ExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the {} extension path at {}; installing {} here enables the shared integration for both agents.",
+            scope,
+            path.display(),
+            agent.name()
+        ),
+        ExtensionShareStatus::Unknown => eprintln!(
+            "[warn] Pi and OMP resolve to the same {} extension path at {}, but RTK could not confirm both agents' ownership; installing {} without a definitive ownership record.",
+            scope,
+            path.display(),
+            agent.name()
+        ),
+    }
+
+    Ok(())
+}
+
+fn confirm_shared_extension_uninstall(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<bool> {
+    let scope = extension_scope_name(global);
+    match extension_share_status(global, path, agent)? {
+        ExtensionShareStatus::NotShared => return Ok(true),
+        ExtensionShareStatus::Unknown => {
+            eprintln!(
+                "[warn] Pi and OMP resolve to the same {} extension path at {}, but RTK could not confirm both agents' ownership; proceeding with {} uninstall without shared-path protection.",
+                scope,
+                path.display(),
+                agent.name()
+            );
+            return Ok(true);
+        }
+        ExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the {} extension path at {}; uninstalling {} changes a path used by the other agent's shared integration.",
+            scope,
+            path.display(),
+            agent.name()
+        ),
+    }
+
+    match patch_mode {
+        PatchMode::Auto => Ok(true),
+        PatchMode::Skip => {
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would leave shared Pi/OMP extension unchanged: {}",
+                    path.display()
+                );
+            }
+            Ok(false)
+        }
+        PatchMode::Ask => {
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would prompt before removing shared Pi/OMP extension: {}",
+                    path.display()
+                );
+                return Ok(false);
+            }
+
+            let prompt = format!("Remove the shared Pi/OMP extension at {}?", path.display());
+            if prompt_user_confirmation(&prompt)? {
+                Ok(true)
+            } else {
+                println!("Skipped removal of shared Pi/OMP extension.");
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn read_extension_for_uninstall(
+    path: &Path,
+    name: &str,
+    ctx: InitContext,
+) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) => {
+            eprintln!(
+                "[warn] {} at {} could not be read; leaving it alone: {}",
+                name,
+                path.display(),
+                error
+            );
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would leave unreadable {} unchanged: {}",
+                    name,
+                    path.display()
+                );
+                print_dry_run_footer();
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "{} at {} could not be read; leaving it alone.",
+                    name,
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Uninstall Pi extension for the given scope.
+/// Mirrors `uninstall_codex` / `uninstall_hermes`: extracted from the dispatcher
+/// so it can be tested and reasoned about independently.
+fn uninstall_pi_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    let InitContext { verbose, dry_run } = ctx;
+    let plugin_path = pi_plugin_path_for_scope(global)?;
+
+    if !plugin_path.exists() {
+        if dry_run {
+            print_dry_run_footer();
+        } else {
+            println!("RTK Pi extension was not installed (nothing to remove)");
+        }
+        return Ok(());
+    }
+
+    let ownership_state_path = shared_agent_state_path(&plugin_path);
+    let Some(content) = read_extension_for_uninstall(&plugin_path, "Pi extension", ctx)? else {
+        return Ok(());
+    };
+
+    if !is_known_stock_pi_plugin(&content) {
+        if looks_like_rtk_pi_plugin(&content) {
+            if dry_run {
+                println!(
+                    "[dry-run] would refuse to remove Pi extension: {}",
+                    plugin_path.display()
+                );
+                print_dry_run_footer();
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Pi extension at {} contains RTK content that does not match the stock extension. Remove the file manually.",
+                plugin_path.display()
+            );
+        }
+        println!(
+            "Pi extension at {} is not RTK content; leaving it alone.",
+            plugin_path.display()
+        );
+        if dry_run {
+            print_dry_run_footer();
+        }
+        return Ok(());
+    }
+
+    if !confirm_shared_extension_uninstall(
+        global,
+        &plugin_path,
+        PiCompatibleAgent::Pi,
+        patch_mode,
+        ctx,
+    )? {
+        if dry_run {
+            print_dry_run_footer();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Shared Pi/OMP extension at {} was not removed; rerun with --auto-patch to approve the removal.",
+            plugin_path.display()
+        );
+    }
+
+    if dry_run {
+        println!(
+            "[dry-run] would remove Pi extension: {}",
+            plugin_path.display()
+        );
+        remove_managed_agent_state(&ownership_state_path, ctx)?;
+        print_dry_run_footer();
+    } else {
+        // nosemgrep: filesystem-deletion -- Pi uninstall removes only a known RTK stock extension.
+        fs::remove_file(&plugin_path)
+            .with_context(|| format!("Failed to remove Pi extension: {}", plugin_path.display()))?;
+        remove_managed_agent_state(&ownership_state_path, ctx)?;
+        if verbose > 0 {
+            eprintln!("Removed Pi extension: {}", plugin_path.display());
+        }
+        println!("RTK uninstalled (Pi):");
+        println!("  - Pi extension: {}", plugin_path.display());
+        println!("\nRestart pi to apply changes.");
     }
     Ok(())
 }
@@ -3448,27 +4100,56 @@ fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
 ///
 /// global=true  → `$PI_CODING_AGENT_DIR/extensions/rtk.ts`
 /// global=false → `.pi/extensions/rtk.ts`
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn run_pi_mode(global: bool, ctx: InitContext) -> Result<()> {
-    let InitContext {
-        verbose: _,
-        dry_run,
-    } = ctx;
-    let plugin_path = if global {
-        let pi_dir = resolve_pi_dir()?;
-        let path = pi_plugin_path(&pi_dir);
-        if let Some(parent) = path.parent() {
-            ensure_pi_extensions_dir(parent, "Pi extensions directory", ctx)?;
-        }
-        path
-    } else {
-        let path = pi_plugin_path_for_scope(false)?;
-        if let Some(parent) = path.parent() {
-            ensure_pi_extensions_dir(parent, "local Pi extensions directory", ctx)?;
-        }
-        path
-    };
+    run_pi_mode_with_patch_mode(global, PatchMode::Ask, ctx)
+}
 
-    let installed = ensure_pi_plugin_installed(&plugin_path, ctx)?;
+/// Install the Pi extension with an explicit confirmation policy for an
+/// existing non-stock file.
+pub fn run_pi_mode_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let plugin_path = pi_plugin_path_for_scope(global)?;
+    let extension_was_present = plugin_path.exists();
+
+    warn_if_extension_shared_on_install(global, &plugin_path, PiCompatibleAgent::Pi)?;
+
+    if !validate_stock_pi_plugin_path(&plugin_path, "Pi extension", patch_mode, ctx)? {
+        if dry_run {
+            print_dry_run_footer();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Pi extension at {} was not changed; remove or back up the file manually before retrying.",
+            plugin_path.display()
+        );
+    }
+
+    if let Some(parent) = plugin_path.parent() {
+        ensure_pi_extensions_dir(
+            parent,
+            if global {
+                "Pi extensions directory"
+            } else {
+                "local Pi extensions directory"
+            },
+            ctx,
+        )?;
+    }
+
+    let installed =
+        write_if_changed_allow_read_error(&plugin_path, PI_PLUGIN, "Pi extension", ctx)?;
+    record_managed_agent(
+        global,
+        &plugin_path,
+        PiCompatibleAgent::Pi,
+        extension_was_present,
+        ctx,
+    )?;
 
     if dry_run {
         print_dry_run_footer();
@@ -3545,6 +4226,213 @@ fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+// ─── Oh My Pi (OMP) support ──────────────────────────────────────────
+
+// OMP ships a `legacy-pi-compat` layer that remaps the Pi coding-agent
+// extension API, so it loads the exact same extension file as Pi
+// (`hooks/pi/rtk.ts`, embedded as `PI_PLUGIN`). Only the install paths
+// differ:
+//
+//   global=true  -> `$HOME/.omp/agent/extensions/rtk.ts`
+//   global=false -> `.omp/extensions/rtk.ts`
+
+/// Return the OMP extension install path for the given scope.
+fn omp_extension_path_for_scope(global: bool) -> Result<PathBuf> {
+    if global {
+        Ok(resolve_omp_dir()?
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE))
+    } else {
+        Ok(PathBuf::from(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE))
+    }
+}
+
+/// Resolve OMP's global agent directory. OMP itself uses
+/// `PI_CODING_AGENT_DIR` for this relocation, so RTK follows the same
+/// override instead of introducing a second path configuration.
+fn resolve_omp_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var(PI_CODING_AGENT_DIR_ENV) {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    resolve_home_subdir(OMP_DIR)
+}
+
+/// Install the shared Pi extension file for OMP (hook-only; no AGENTS.md
+/// injection). OMP loads the file through its `legacy-pi-compat` layer.
+///
+/// global=true  -> `$HOME/.omp/agent/extensions/rtk.ts`
+/// global=false -> `.omp/extensions/rtk.ts`
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
+pub fn run_omp_mode(global: bool, ctx: InitContext) -> Result<()> {
+    run_omp_mode_with_patch_mode(global, PatchMode::Ask, ctx)
+}
+
+/// Install the shared Pi extension file for OMP with an explicit
+/// confirmation policy for an existing non-stock file.
+pub fn run_omp_mode_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let path = omp_extension_path_for_scope(global)?;
+    let extension_was_present = path.exists();
+
+    warn_if_extension_shared_on_install(global, &path, PiCompatibleAgent::Omp)?;
+
+    if !validate_stock_pi_plugin_path(&path, "OMP extension", patch_mode, ctx)? {
+        if dry_run {
+            print_dry_run_footer();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "OMP extension at {} was not changed; remove or back up the file manually before retrying.",
+            path.display()
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        ensure_pi_extensions_dir(
+            parent,
+            if global {
+                "OMP extensions directory"
+            } else {
+                "local OMP extensions directory"
+            },
+            ctx,
+        )?;
+    }
+
+    let installed =
+        write_if_changed_allow_read_error(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+    record_managed_agent(
+        global,
+        &path,
+        PiCompatibleAgent::Omp,
+        extension_was_present,
+        ctx,
+    )?;
+
+    if dry_run {
+        print_dry_run_footer();
+    } else {
+        print_omp_result(&path, installed);
+    }
+
+    Ok(())
+}
+
+fn print_omp_result(extension_path: &Path, installed: bool) {
+    let status = if installed {
+        "installed"
+    } else {
+        "already up to date"
+    };
+    println!("RTK OMP extension {}:", status);
+    println!("  Extension: {}", extension_path.display());
+    println!();
+    println!("OMP will load the extension automatically on next start.");
+}
+
+/// Uninstall the OMP extension for the given scope.
+///
+/// The installed file is the shared stock Pi extension. Current and known
+/// historical stock content is removed; RTK content that no longer matches a
+/// known stock revision is left in place with a manual-removal notice.
+/// Unrelated content is never touched.
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
+pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
+    uninstall_omp_with_patch_mode(global, PatchMode::Ask, ctx)
+}
+
+/// Uninstall the OMP extension with an explicit confirmation policy for a
+/// global path shared with Pi.
+pub fn uninstall_omp_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    let InitContext { verbose, dry_run } = ctx;
+    let path = omp_extension_path_for_scope(global)?;
+
+    if !path.exists() {
+        if dry_run {
+            print_dry_run_footer();
+        } else {
+            println!("RTK OMP extension was not installed (nothing to remove)");
+        }
+        return Ok(());
+    }
+
+    let ownership_state_path = shared_agent_state_path(&path);
+    let Some(content) = read_extension_for_uninstall(&path, "OMP extension", ctx)? else {
+        return Ok(());
+    };
+
+    if is_known_stock_pi_plugin(&content) {
+        if !confirm_shared_extension_uninstall(
+            global,
+            &path,
+            PiCompatibleAgent::Omp,
+            patch_mode,
+            ctx,
+        )? {
+            if dry_run {
+                print_dry_run_footer();
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Shared Pi/OMP extension at {} was not removed; rerun with --auto-patch to approve the removal.",
+                path.display()
+            );
+        }
+
+        if dry_run {
+            println!("[dry-run] would remove OMP extension: {}", path.display());
+            remove_managed_agent_state(&ownership_state_path, ctx)?;
+            print_dry_run_footer();
+        } else {
+            // nosemgrep: filesystem-deletion -- OMP uninstall removes only the RTK-managed extension file.
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove OMP extension: {}", path.display()))?;
+            remove_managed_agent_state(&ownership_state_path, ctx)?;
+            if verbose > 0 {
+                eprintln!("Removed OMP extension: {}", path.display());
+            }
+            println!("RTK uninstalled (OMP):");
+            println!("  - Extension: {}", path.display());
+            println!("\nRestart OMP to apply changes.");
+        }
+    } else if looks_like_rtk_pi_plugin(&content) {
+        if dry_run {
+            println!(
+                "[dry-run] would refuse to remove OMP extension: {}",
+                path.display()
+            );
+            print_dry_run_footer();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "OMP extension at {} contains RTK content that does not match the stock extension. Remove the file manually.",
+            path.display()
+        );
+    } else {
+        println!(
+            "OMP extension at {} is not RTK content; leaving it alone.",
+            path.display()
+        );
+        if dry_run {
+            print_dry_run_footer();
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Cursor Agent support ─────────────────────────────────────────────
 
 fn resolve_cursor_dir() -> Result<PathBuf> {
@@ -3611,10 +4499,11 @@ fn patch_cursor_hooks_json(path: &Path, ctx: InitContext) -> Result<bool> {
     let mut root = if path.exists() {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
+        let content = strip_leading_bom(&content);
         if content.trim().is_empty() {
             serde_json::json!({ "version": 1 })
         } else {
-            serde_json::from_str(&content)
+            from_json_str(content)
                 .with_context(|| format!("Failed to parse {} as JSON", path.display()))?
         }
     } else {
@@ -3722,12 +4611,13 @@ fn remove_legacy_cursor_hooks_json_entries(path: &Path, ctx: InitContext) -> Res
 
     let content =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let content = strip_leading_bom(&content);
     if content.trim().is_empty() {
         return Ok(());
     }
 
-    let mut root: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut root: serde_json::Value =
+        from_json_str(content).with_context(|| format!("Failed to parse {}", path.display()))?;
 
     if !remove_legacy_cursor_hook_entries_from_json(&mut root) {
         return Ok(());
@@ -3803,9 +4693,10 @@ fn remove_cursor_hooks(ctx: InitContext) -> Result<Vec<String>> {
     if hooks_json_path.exists() {
         let content = fs::read_to_string(&hooks_json_path)
             .with_context(|| format!("Failed to read {}", hooks_json_path.display()))?;
+        let content = strip_leading_bom(&content);
 
         if !content.trim().is_empty() {
-            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Ok(mut root) = from_json_str::<serde_json::Value>(content) {
                 if remove_cursor_hook_from_json(&mut root) {
                     if dry_run {
                         println!(
@@ -3858,12 +4749,72 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
 }
 
 /// Show current rtk configuration
-pub fn show_config(codex: bool) -> Result<()> {
+pub fn show_config(codex: bool, omp: bool) -> Result<()> {
+    if omp {
+        return show_omp_config();
+    }
     if codex {
         return show_codex_config();
     }
 
     show_claude_config()
+}
+
+/// Show OMP configuration status.
+fn show_omp_config() -> Result<()> {
+    let global_extension = omp_extension_path_for_scope(true)?;
+    let project_extension = omp_extension_path_for_scope(false)?;
+
+    println!("rtk Configuration (Oh My Pi):\n");
+    print_omp_extension_status("Global extension", &global_extension)?;
+    print_omp_extension_status("Project extension", &project_extension)?;
+
+    println!("\nUsage:");
+    println!("  rtk init --agent omp                 # Configure ./.omp/extensions/rtk.ts");
+    println!(
+        "  rtk init -g --agent omp              # Configure {}",
+        global_extension.display()
+    );
+    println!("  rtk init --agent omp --uninstall     # Remove project OMP RTK extension");
+    println!("  rtk init -g --agent omp --uninstall  # Remove global OMP RTK extension");
+
+    Ok(())
+}
+
+fn print_omp_extension_status(label: &str, path: &Path) -> Result<()> {
+    if path.exists() {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => {
+                println!("  {}: {} (unreadable)", label, path.display());
+                return Ok(());
+            }
+        };
+        if is_current_pi_plugin(&content) {
+            println!("  {}: {} (up to date)", label, path.display());
+        } else if is_known_stock_pi_plugin(&content) {
+            println!(
+                "  {}: {} (stock version - will be replaced on next rtk init)",
+                label,
+                path.display()
+            );
+        } else if looks_like_rtk_pi_plugin(&content) {
+            println!(
+                "  {}: {} (modified RTK content - rtk init will ask before overwriting; use --auto-patch to replace)",
+                label,
+                path.display()
+            );
+        } else {
+            println!(
+                "  {}: {} (unrelated content - rtk init will ask before overwriting; use --auto-patch to replace)",
+                label,
+                path.display()
+            );
+        }
+    } else {
+        println!("  {}: {} (not installed)", label, path.display());
+    }
+    Ok(())
 }
 
 fn show_claude_config() -> Result<()> {
@@ -3879,7 +4830,7 @@ fn show_claude_config() -> Result<()> {
     let settings_path = claude_dir.join(SETTINGS_JSON);
     let binary_hook_registered = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
-        if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Ok(root) = from_json_str::<serde_json::Value>(&content) {
             hook_already_present(&root, CLAUDE_HOOK_COMMAND)
         } else {
             false
@@ -3999,8 +4950,9 @@ fn show_claude_config() -> Result<()> {
     // Check settings.json (detailed status)
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
+        let content = strip_leading_bom(&content);
         if !content.trim().is_empty() {
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Ok(root) = from_json_str::<serde_json::Value>(content) {
                 if hook_already_present(&root, CLAUDE_HOOK_COMMAND) {
                     println!("[ok] settings.json: RTK hook configured");
                 } else {
@@ -4037,7 +4989,7 @@ fn show_claude_config() -> Result<()> {
         // Check for binary command in hooks.json first
         let cursor_binary_registered = if cursor_hooks_json.exists() {
             let content = fs::read_to_string(&cursor_hooks_json).unwrap_or_default();
-            if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Ok(root) = from_json_str::<serde_json::Value>(&content) {
                 cursor_hook_already_present(&root)
             } else {
                 false
@@ -4229,7 +5181,7 @@ pub fn run_gemini(
     }
 
     // 3. Patch ~/.gemini/settings.json
-    patch_gemini_settings(&gemini_dir, &hook_path, patch_mode, ctx)?;
+    let settings_parse_failed = patch_gemini_settings(&gemini_dir, &hook_path, patch_mode, ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -4239,18 +5191,37 @@ pub fn run_gemini(
         if !hook_only {
             println!("  GEMINI.md: {}", gemini_dir.join(GEMINI_MD).display());
         }
+        if settings_parse_failed {
+            println!("  settings.json: NOT patched (existing file could not be parsed; see warning above)");
+        }
         println!("  Restart Gemini CLI. Test with: git status\n");
     }
     Ok(())
 }
 
-/// Patch ~/.gemini/settings.json with the BeforeTool hook
+/// Print the manual-setup instructions for ~/.gemini/settings.json, shared by
+/// PatchMode::Skip and the unparseable-settings fallback in
+/// `patch_gemini_settings`.
+fn print_gemini_manual_setup(settings_path: &Path) {
+    println!(
+        "\nManual setup needed: add RTK hook to {}\n\
+         See: https://github.com/rtk-ai/rtk#gemini-cli",
+        settings_path.display()
+    );
+}
+
+/// Patch ~/.gemini/settings.json with the BeforeTool hook.
+///
+/// Returns `Ok(true)` when the existing settings.json could not be parsed
+/// (so the caller can tell an honest "hook installed, settings.json NOT
+/// patched" apart from every other reason nothing changed — already
+/// patched, `PatchMode::Skip`, declined at the `Ask` prompt, dry-run).
 fn patch_gemini_settings(
     gemini_dir: &Path,
     hook_path: &Path,
     patch_mode: PatchMode,
     ctx: InitContext,
-) -> Result<()> {
+) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
     let settings_path = gemini_dir.join(SETTINGS_JSON);
     let hook_cmd = hook_path.to_string_lossy().to_string();
@@ -4259,7 +5230,29 @@ fn patch_gemini_settings(
     let mut settings: serde_json::Value = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)
             .with_context(|| format!("Failed to read {}", settings_path.display()))?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        let content = strip_leading_bom(&content);
+
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            match from_json_str(content) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A parse failure must not abort the whole `rtk init` run
+                    // (run_gemini has already written the hook script,
+                    // GEMINI.md, and the integrity baseline by this point).
+                    // Treat it like PatchMode::Skip: warn, tell the user how
+                    // to patch it themselves, and leave the file untouched.
+                    eprintln!(
+                        "Warning: failed to parse {} as JSON: {}",
+                        settings_path.display(),
+                        e
+                    );
+                    print_gemini_manual_setup(&settings_path);
+                    return Ok(true);
+                }
+            }
+        }
     } else {
         serde_json::json!({})
     };
@@ -4275,19 +5268,15 @@ fn patch_gemini_settings(
                 if verbose > 0 {
                     eprintln!("Gemini settings.json already has RTK hook");
                 }
-                return Ok(());
+                return Ok(false);
             }
         }
     }
 
     // Ask user before patching
     if patch_mode == PatchMode::Skip {
-        println!(
-            "\nManual setup needed: add RTK hook to {}\n\
-             See: https://github.com/rtk-ai/rtk#gemini-cli",
-            settings_path.display()
-        );
-        return Ok(());
+        print_gemini_manual_setup(&settings_path);
+        return Ok(false);
     }
 
     if patch_mode == PatchMode::Ask {
@@ -4303,7 +5292,7 @@ fn patch_gemini_settings(
             std::io::stdin().read_line(&mut answer)?;
             if !answer.trim().eq_ignore_ascii_case("y") {
                 println!("Skipped. Add hook manually later.");
-                return Ok(());
+                return Ok(false);
             }
         }
     }
@@ -4345,7 +5334,7 @@ fn patch_gemini_settings(
         if verbose > 0 {
             println!("[dry-run] content:\n{}", content);
         }
-        return Ok(());
+        return Ok(false);
     }
 
     // Write atomically
@@ -4358,7 +5347,7 @@ fn patch_gemini_settings(
         eprintln!("Patched {}", settings_path.display());
     }
 
-    Ok(())
+    Ok(false)
 }
 
 /// Remove Gemini artifacts during uninstall
@@ -4401,7 +5390,7 @@ fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
     let settings_path = gemini_dir.join(SETTINGS_JSON);
     if settings_path.exists() {
         let content = fs::read_to_string(&settings_path)?;
-        if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Ok(mut settings) = from_json_str::<serde_json::Value>(&content) {
             let bt_pointer = format!("/hooks/{}", BEFORE_TOOL_KEY);
             if let Some(arr) = settings
                 .pointer_mut(&bt_pointer)
@@ -4436,10 +5425,357 @@ fn uninstall_gemini(ctx: InitContext) -> Result<Vec<String>> {
     Ok(removed)
 }
 
+// ── Vibe integration ────────────────────────────────────────
+
+fn resolve_vibe_dir() -> Result<PathBuf> {
+    resolve_home_subdir(VIBE_DIR)
+}
+
+/// Entry point for `rtk init -g --agent vibe`.
+///
+/// Installs a `pre_tool` hook into `~/.vibe/hooks.toml` (Vibe CLI's hook
+/// registry, see https://docs.mistral.ai/vibe/code/cli/hooks) that routes
+/// bash tool calls through the native `rtk hook vibe` binary. When not
+/// `hook_only`, also drops an `~/.vibe/prompts/rtk.md` system prompt file
+/// as a belt-and-suspenders fallback if the hook is disabled.
+pub fn run_vibe_mode(
+    global: bool,
+    hook_only: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    if !global {
+        anyhow::bail!("Vibe support is global-only. Use: rtk init -g --agent vibe");
+    }
+    let vibe_dir = resolve_vibe_dir()?;
+    run_vibe_mode_at(&vibe_dir, hook_only, patch_mode, ctx)
+}
+
+fn run_vibe_mode_at(
+    vibe_dir: &Path,
+    hook_only: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    if !dry_run {
+        fs::create_dir_all(vibe_dir)
+            .with_context(|| format!("Failed to create Vibe config dir: {}", vibe_dir.display()))?;
+    }
+
+    let hooks_path = vibe_dir.join(VIBE_HOOKS_FILE);
+    let hook_outcome = patch_vibe_hooks_toml(&hooks_path, patch_mode, ctx)?;
+
+    if !hook_only {
+        let prompts_dir = vibe_dir.join(VIBE_PROMPTS_SUBDIR);
+        if !dry_run {
+            fs::create_dir_all(&prompts_dir).with_context(|| {
+                format!("Failed to create prompts dir: {}", prompts_dir.display())
+            })?;
+        }
+        let prompt_path = prompts_dir.join(VIBE_PROMPT_FILE);
+        write_if_changed(&prompt_path, RTK_SLIM, VIBE_PROMPT_FILE, ctx)?;
+    }
+
+    if dry_run {
+        print_dry_run_footer();
+    } else if let Some(summary_verb) = hook_outcome.summary_verb() {
+        println!("\nMistral Vibe CLI hook {summary_verb} (global).\n");
+        println!("  Hook registry: {}", hooks_path.display());
+        if !hook_only {
+            println!(
+                "  Prompt: {}",
+                vibe_dir
+                    .join(VIBE_PROMPTS_SUBDIR)
+                    .join(VIBE_PROMPT_FILE)
+                    .display()
+            );
+        }
+        println!("  Restart Vibe. Test with: git status\n");
+    }
+    Ok(())
+}
+
+/// Outcome of `patch_vibe_hooks_toml`. Distinguishes installed / already-present /
+/// skipped so the caller can decide whether the "installed" summary is truthful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VibeHookPatchOutcome {
+    Installed,
+    AlreadyPresent,
+    Skipped,
+}
+
+impl VibeHookPatchOutcome {
+    fn summary_verb(self) -> Option<&'static str> {
+        match self {
+            Self::Installed => Some("installed"),
+            Self::AlreadyPresent => Some("already present"),
+            Self::Skipped => None,
+        }
+    }
+}
+
+/// Append the RTK `[[hooks]]` entry to `~/.vibe/hooks.toml` if not already present.
+///
+/// Uses append-based patching (string level) rather than parse-serialize round-trip
+/// to preserve any user comments and formatting in the file.
+fn patch_vibe_hooks_toml(
+    hooks_path: &Path,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<VibeHookPatchOutcome> {
+    let InitContext { verbose, dry_run } = ctx;
+
+    let existing = if hooks_path.exists() {
+        fs::read_to_string(hooks_path)
+            .with_context(|| format!("Failed to read {}", hooks_path.display()))?
+    } else {
+        String::new()
+    };
+
+    if vibe_hooks_toml_has_rtk(&existing) {
+        if verbose > 0 {
+            eprintln!("Vibe hooks.toml already has RTK hook");
+        }
+        return Ok(VibeHookPatchOutcome::AlreadyPresent);
+    }
+
+    if patch_mode == PatchMode::Skip {
+        println!(
+            "\nManual setup needed: add RTK hook to {}\n\
+             See: https://www.rtk-ai.app/guide/getting-started/supported-agents#mistral-vibe",
+            hooks_path.display()
+        );
+        return Ok(VibeHookPatchOutcome::Skipped);
+    }
+
+    if patch_mode == PatchMode::Ask {
+        if dry_run {
+            println!(
+                "[dry-run] would prompt before patching {}",
+                hooks_path.display()
+            );
+        } else {
+            print!("Patch {} with RTK hook? [y/N] ", hooks_path.display());
+            std::io::stdout().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).ok();
+            if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                println!(
+                    "Skipped. Re-run with --auto-patch, or add the hook manually to {}",
+                    hooks_path.display()
+                );
+                return Ok(VibeHookPatchOutcome::Skipped);
+            }
+        }
+    }
+
+    let entry = vibe_hook_entry();
+    let new_content = if existing.is_empty() {
+        entry.clone()
+    } else if existing.ends_with("\n\n") {
+        format!("{existing}{entry}")
+    } else if existing.ends_with('\n') {
+        format!("{existing}\n{entry}")
+    } else {
+        format!("{existing}\n\n{entry}")
+    };
+
+    if dry_run {
+        println!(
+            "[dry-run] would patch Vibe hooks.toml: {}",
+            hooks_path.display()
+        );
+        if verbose > 0 {
+            println!("[dry-run] appended entry:\n{entry}");
+        }
+    } else {
+        atomic_write(hooks_path, &new_content)
+            .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
+    }
+    Ok(VibeHookPatchOutcome::Installed)
+}
+
+/// TOML entry emitted for the Vibe pre_tool hook. Mirrors the shape documented
+/// at https://docs.mistral.ai/vibe/code/cli/hooks.
+fn vibe_hook_entry() -> String {
+    format!(
+        r#"[[hooks]]
+name = "{name}"
+type = "pre_tool"
+match = "{match_glob}"
+command = "{command}"
+timeout = 10.0
+strict = false
+description = "Rewrite bash commands through the rtk proxy to save tokens."
+"#,
+        name = VIBE_HOOK_NAME,
+        match_glob = VIBE_BASH_MATCH,
+        command = VIBE_HOOK_COMMAND,
+    )
+}
+
+/// Detect an existing RTK entry by looking for the hook `name` field. Scanning
+/// the raw string is enough because `name` is required by Vibe and must be
+/// unique, so a substring match is both necessary and sufficient.
+///
+/// Tradeoff: matches the exact spacing `name = "rtk-rewrite"`. A reformatted
+/// file (`name="rtk-rewrite"` or extra whitespace) would defeat idempotency
+/// and cause a duplicate append on re-install. Acceptable because our own
+/// installer only ever writes the canonical spacing, and the alternative
+/// (parse-serialize round-trip via toml_edit) would clobber user comments
+/// and formatting in the file.
+fn vibe_hooks_toml_has_rtk(content: &str) -> bool {
+    let needle = format!(r#"name = "{VIBE_HOOK_NAME}""#);
+    content.contains(&needle)
+}
+
+/// Public entry point for `rtk init -g --agent vibe --uninstall`.
+pub fn uninstall_vibe(ctx: InitContext) -> Result<()> {
+    let InitContext { dry_run, .. } = ctx;
+    let vibe_dir = match resolve_vibe_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("RTK Vibe uninstall skipped: could not resolve ~/.vibe/ ({e})");
+            return Ok(());
+        }
+    };
+    let removed = uninstall_vibe_at(&vibe_dir, ctx)?;
+
+    if removed.is_empty() {
+        println!("RTK Vibe support was not installed (nothing to remove)");
+    } else {
+        let header = if dry_run {
+            "[dry-run] would uninstall RTK for Mistral Vibe CLI:"
+        } else {
+            "RTK uninstalled for Mistral Vibe CLI:"
+        };
+        println!("{}", header);
+        for item in removed {
+            println!("  - {}", item);
+        }
+        if !dry_run {
+            println!("\nRestart Vibe CLI to apply changes.");
+        }
+    }
+
+    if dry_run {
+        print_dry_run_footer();
+    }
+    Ok(())
+}
+
+/// Remove the RTK hook entry (and, when non-empty, the surrounding blank
+/// lines) from `~/.vibe/hooks.toml` and the sibling `~/.vibe/prompts/rtk.md`
+/// prompt file. Leaves any other user-declared hooks intact.
+fn uninstall_vibe_at(vibe_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
+    let InitContext { verbose, dry_run } = ctx;
+    let mut removed = Vec::new();
+
+    let prompt_path = vibe_dir.join(VIBE_PROMPTS_SUBDIR).join(VIBE_PROMPT_FILE);
+    if prompt_path.exists() {
+        if dry_run {
+            println!(
+                "[dry-run] would remove Vibe RTK prompt: {}",
+                prompt_path.display()
+            );
+        } else {
+            // nosemgrep: filesystem-deletion -- uninstall path removes only RTK's own prompt file
+            fs::remove_file(&prompt_path)
+                .with_context(|| format!("Failed to remove {}", prompt_path.display()))?;
+        }
+        removed.push(format!("Vibe prompt: {}", prompt_path.display()));
+    }
+
+    let hooks_path = vibe_dir.join(VIBE_HOOKS_FILE);
+    if hooks_path.exists() {
+        let content = fs::read_to_string(&hooks_path)
+            .with_context(|| format!("Failed to read {}", hooks_path.display()))?;
+        if let Some(new_content) = strip_vibe_rtk_entry(&content) {
+            if dry_run {
+                println!(
+                    "[dry-run] would remove RTK hook from Vibe hooks.toml: {}",
+                    hooks_path.display()
+                );
+            } else if new_content.trim().is_empty() {
+                // nosemgrep: filesystem-deletion -- uninstall removes hooks.toml only when it becomes empty after stripping the RTK entry
+                fs::remove_file(&hooks_path)
+                    .with_context(|| format!("Failed to remove {}", hooks_path.display()))?;
+            } else {
+                atomic_write(&hooks_path, &new_content)
+                    .with_context(|| format!("Failed to write {}", hooks_path.display()))?;
+            }
+            removed.push(format!(
+                "Vibe hooks.toml: removed RTK entry ({})",
+                hooks_path.display()
+            ));
+        }
+    }
+
+    if verbose > 0 && !removed.is_empty() {
+        eprintln!("Vibe artifacts removed");
+    }
+
+    Ok(removed)
+}
+
+/// Extract and drop the `[[hooks]]` block whose `name = "rtk-rewrite"` field
+/// is set. Returns `None` when the entry is absent, `Some(new_content)` after
+/// removal (with surrounding blank lines collapsed). The scan walks `[[hooks]]`
+/// section boundaries — anything else in the file is preserved verbatim.
+fn strip_vibe_rtk_entry(content: &str) -> Option<String> {
+    let needle = format!(r#"name = "{VIBE_HOOK_NAME}""#);
+    if !content.contains(&needle) {
+        return None;
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut sections: Vec<(usize, usize)> = Vec::new();
+    let mut current_start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[[hooks]]") || trimmed.starts_with('[') {
+            if let Some(start) = current_start.take() {
+                sections.push((start, i));
+            }
+            if trimmed.starts_with("[[hooks]]") {
+                current_start = Some(i);
+            }
+        }
+    }
+    if let Some(start) = current_start {
+        sections.push((start, lines.len()));
+    }
+
+    let target = sections
+        .iter()
+        .find(|(start, end)| lines[*start..*end].iter().any(|l| l.contains(&needle)))?;
+
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    kept.extend(&lines[..target.0]);
+    kept.extend(&lines[target.1..]);
+
+    let mut out = kept.join("\n");
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
 // ── Copilot integration ─────────────────────────────────────
 
-// PreToolUse = VS Code schema, preToolUse = Copilot CLI schema (same file, both hosts).
-const COPILOT_HOOK_JSON: &str = r#"{
+// Single PascalCase `PreToolUse` entry, shared by VS Code Copilot Chat and
+// Copilot CLI. Previously this file also declared a camelCase `preToolUse`
+// entry for Copilot CLI's native schema, but Copilot CLI registers BOTH keys
+// as independent hooks and runs them sequentially, chaining the camelCase
+// hook's rewrite into the PascalCase hook's input — a redundant second
+// process spawn per tool call for no behavioral benefit (confirmed live:
+// Copilot CLI honors the PascalCase-only schema on its own, receiving the
+// same `tool_name`/`tool_input.command` shape either way).
+pub(crate) const COPILOT_HOOK_JSON: &str = r#"{
   "version": 1,
   "hooks": {
     "PreToolUse": [
@@ -4448,15 +5784,6 @@ const COPILOT_HOOK_JSON: &str = r#"{
         "command": "rtk hook copilot",
         "cwd": ".",
         "timeout": 5
-      }
-    ],
-    "preToolUse": [
-      {
-        "type": "command",
-        "bash": "rtk hook copilot",
-        "powershell": "rtk hook copilot",
-        "cwd": ".",
-        "timeoutSec": 5
       }
     ]
   }
@@ -4478,7 +5805,7 @@ git status                 rtk git status
 git log -10                rtk git log -10
 cargo test                 rtk cargo test
 docker ps                  rtk docker ps
-kubectl get pods           rtk kubectl pods
+kubectl get pods           rtk kubectl get pods
 ```
 
 ## Meta commands (use directly)
@@ -4620,7 +5947,7 @@ fn uninstall_copilot_at(base: &Path, ctx: InitContext) -> Result<Vec<String>> {
     Ok(removed)
 }
 
-fn copilot_user_dir() -> Result<PathBuf> {
+pub(crate) fn copilot_user_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var(COPILOT_HOME_ENV) {
         return Ok(PathBuf::from(custom));
     }
@@ -4750,6 +6077,7 @@ fn uninstall_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
 
     #[test]
@@ -6845,6 +8173,21 @@ mod tests {
         }
     }
 
+    fn with_omp_dir_override<F: FnOnce(&Path)>(tmp: &TempDir, f: F) {
+        // OMP reuses PI_CODING_AGENT_DIR, so share the Pi environment lock.
+        let _guard = PI_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let omp_dir = tmp.path().join("omp_agent");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let orig = std::env::var_os(PI_CODING_AGENT_DIR_ENV);
+        std::env::set_var(PI_CODING_AGENT_DIR_ENV, &omp_dir);
+        f(&omp_dir);
+        match orig {
+            Some(v) => std::env::set_var(PI_CODING_AGENT_DIR_ENV, v),
+            None => std::env::remove_var(PI_CODING_AGENT_DIR_ENV),
+        }
+    }
+
     #[test]
     fn test_global_default_mode_creates_artifacts() {
         let tmp = TempDir::new().unwrap();
@@ -6868,11 +8211,134 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_settings_json_tolerates_utf8_bom() {
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            // Notepad and PowerShell 5.1 `Out-File -Encoding utf8` prepend a BOM.
+            let settings = claude_dir.join(SETTINGS_JSON);
+            fs::write(&settings, "\u{feff}{\"foo\": 1}").unwrap();
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Auto,
+                false,
+                InitContext::default(),
+            );
+            assert!(
+                result.is_ok(),
+                "BOM-prefixed settings.json must not abort init: {:?}",
+                result.err()
+            );
+
+            let content = fs::read_to_string(&settings).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["foo"], 1, "existing keys must survive the patch");
+            assert!(
+                content.contains(CLAUDE_HOOK_COMMAND),
+                "hook must be installed"
+            );
+        });
+    }
+
+    #[test]
+    fn test_patch_settings_json_bom_plus_invalid_json_still_errors() {
+        // Stripping the BOM must not mask genuinely broken JSON: the
+        // parse-error context has to survive so the user gets blamed for
+        // the right thing.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let settings = claude_dir.join(SETTINGS_JSON);
+            fs::write(&settings, "\u{feff}{not valid json").unwrap();
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Auto,
+                false,
+                InitContext::default(),
+            );
+            let err = result.expect_err("invalid JSON must still fail");
+            assert!(
+                err.to_string().contains("Failed to parse"),
+                "error must carry the parse context, got: {err:#}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_patch_settings_json_bom_only_file() {
+        // U+FEFF is not whitespace, so the `content.trim().is_empty()`
+        // empty-file guard does not catch a BOM-only file.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            let settings = claude_dir.join(SETTINGS_JSON);
+            fs::write(&settings, "\u{feff}").unwrap();
+
+            let result = patch_settings_json_command(
+                CLAUDE_HOOK_COMMAND,
+                PatchMode::Auto,
+                false,
+                InitContext::default(),
+            );
+            assert!(
+                result.is_ok(),
+                "BOM-only settings.json must be treated as empty: {:?}",
+                result.err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_patch_gemini_settings_malformed_json_warns_without_overwriting() {
+        // A parse failure (not a BOM) must not abort `rtk init` — by the time
+        // patch_gemini_settings runs, run_gemini has already written the hook
+        // script, GEMINI.md, and the integrity baseline, so aborting here
+        // would leave a half-installed state with no summary. Treat it like
+        // PatchMode::Skip: warn and continue, and critically still never
+        // overwrite the unparsed file. Unlike Skip (and every other
+        // non-patch outcome), this path returns Ok(true) so run_gemini's
+        // final summary can honestly say settings.json was NOT patched
+        // instead of implying full success.
+        let tmp = TempDir::new().unwrap();
+        let gemini_dir = tmp.path().join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+        let settings_path = gemini_dir.join(SETTINGS_JSON);
+        let original = "{\"model\": \"foo\", \"mcpServers\": {},"; // trailing comma
+        fs::write(&settings_path, original).unwrap();
+
+        let result = patch_gemini_settings(
+            &gemini_dir,
+            Path::new("/fake/hook/path"),
+            PatchMode::Auto,
+            InitContext::default(),
+        );
+
+        assert!(
+            result.unwrap(),
+            "parse failure must be signaled so the summary can say settings.json was NOT patched"
+        );
+
+        let content = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            content, original,
+            "settings.json must not be overwritten when parsing fails"
+        );
+    }
+
+    #[test]
     fn test_global_uninstall_removes_artifacts() {
         let tmp = TempDir::new().unwrap();
         with_claude_dir_override(&tmp, |claude_dir| {
             run_default_mode(true, PatchMode::Auto, false, InitContext::default()).unwrap();
-            uninstall(true, false, false, false, false, InitContext::default()).unwrap();
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                InitContext::default(),
+            )
+            .unwrap();
 
             assert!(!claude_dir.join(RTK_MD).exists(), "RTK.md must be removed");
             let settings_content =
@@ -7000,7 +8466,7 @@ mod tests {
                 dry_run: true,
                 ..Default::default()
             };
-            uninstall(true, false, false, false, false, dry).unwrap();
+            uninstall(true, false, false, false, false, false, dry).unwrap();
 
             // Files must still exist with identical content
             assert!(
@@ -7157,6 +8623,13 @@ mod tests {
                 content.contains("rtk rewrite"),
                 "extension must delegate to rtk rewrite"
             );
+            // Regression guard for #2753: a value import (e.g. `import { isToolCallEventType }`)
+            // pulls in the whole @earendil-works/pi-coding-agent barrel at extension load,
+            // adding ~250ms of startup latency. Only `import type { ... }` is allowed.
+            assert!(
+                !content.contains("import {"),
+                "extension must not load the Pi package at runtime"
+            );
         });
     }
 
@@ -7177,6 +8650,57 @@ mod tests {
             .join(PI_EXTENSIONS_SUBDIR)
             .join(PI_PLUGIN_FILE);
         assert!(plugin.exists(), "local Pi extension must be created");
+    }
+
+    #[test]
+    fn test_pi_install_refuses_modified_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_pi_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("was not changed"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
+    }
+
+    #[test]
+    fn test_pi_install_dry_run_reports_refusal_without_error() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_pi_mode(
+            false,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
     #[test]
@@ -7226,7 +8750,17 @@ mod tests {
             let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             assert!(plugin.exists());
 
-            uninstall(true, false, false, false, true, InitContext::default()).unwrap();
+            uninstall_with_patch_mode(
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                PatchMode::Auto,
+                InitContext::default(),
+            )
+            .unwrap();
 
             assert!(!plugin.exists(), "plugin must be removed");
         });
@@ -7240,7 +8774,15 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         run_pi_mode(false, InitContext::default()).unwrap();
-        let result = uninstall(false, false, false, false, true, InitContext::default());
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        );
         std::env::set_current_dir(&cwd).unwrap();
         result.unwrap();
 
@@ -7339,6 +8881,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 InitContext {
                     verbose: 0,
                     dry_run: true,
@@ -7377,6 +8920,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InitContext {
                 verbose: 0,
                 dry_run: true,
@@ -7389,6 +8933,664 @@ mod tests {
             plugin.exists(),
             "dry-run uninstall must not remove the local Pi extension"
         );
+    }
+
+    #[test]
+    fn test_pi_uninstall_modified_extension_bails() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, format!("{}\n// user modification\n", PI_PLUGIN)).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the stock extension"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(path.exists(), "modified extension must not be removed");
+    }
+
+    #[test]
+    fn test_pi_uninstall_modified_extension_dry_run_is_preview() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, format!("{}\n// user modification\n", PI_PLUGIN)).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "dry-run must preserve modified extension");
+    }
+
+    #[test]
+    fn test_pi_uninstall_unreadable_extension_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not be read; leaving it alone"),
+            "unreadable extension uninstall should fail clearly: {err}"
+        );
+        assert!(path.exists(), "unreadable extension must be left alone");
+    }
+
+    #[test]
+    fn test_pi_uninstall_unrelated_content_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// rtk rewrite is mentioned here\nexport default () => {}\n",
+        )
+        .unwrap();
+
+        uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        )
+        .unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        assert!(path.exists(), "non-RTK extension must be left in place");
+    }
+
+    #[test]
+    fn test_known_pi_plugin_hashes_are_sha256() {
+        assert!(
+            KNOWN_PI_PLUGIN_HASHES.len() >= 8,
+            "historical Pi extension hashes must not be removed"
+        );
+        assert!(KNOWN_PI_PLUGIN_HASHES
+            .iter()
+            .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())));
+
+        let current_hash = integrity::compute_hash_bytes(
+            normalize_pi_plugin_line_endings(PI_PLUGIN)
+                .trim_end()
+                .as_bytes(),
+        );
+        assert!(
+            KNOWN_PI_PLUGIN_HASHES.contains(&current_hash.as_str()),
+            "current Pi extension hash {current_hash} is missing from KNOWN_PI_PLUGIN_HASHES"
+        );
+        assert!(is_known_stock_pi_plugin(PI_PLUGIN));
+
+        let crlf = PI_PLUGIN.replace("\r\n", "\n").replace('\n', "\r\n");
+        assert!(is_current_pi_plugin(&crlf));
+        assert!(is_known_stock_pi_plugin(&crlf));
+
+        let modified = format!("{}\n// user modification\n", PI_PLUGIN);
+        assert!(!is_known_stock_pi_plugin(&modified));
+    }
+
+    #[test]
+    fn test_all_git_pi_plugin_revisions_are_allowlisted() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !manifest_dir.join(".git").exists() {
+            // Source archives do not contain Git history. CI checks out the
+            // repository with full history so this guard remains active there.
+            return;
+        }
+
+        let revisions = Command::new("git")
+            .current_dir(manifest_dir)
+            .args([
+                "rev-list",
+                "HEAD",
+                "--full-history",
+                "--",
+                "hooks/pi/rtk.ts",
+            ])
+            .output()
+            .expect("git must be available to verify Pi extension history");
+        assert!(
+            revisions.status.success(),
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&revisions.stderr)
+        );
+
+        let mut commits: Vec<String> = String::from_utf8(revisions.stdout)
+            .expect("git revision list must be UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        commits.push("HEAD".to_owned());
+        commits.sort();
+        commits.dedup();
+
+        for commit in commits {
+            let object = format!("{commit}:hooks/pi/rtk.ts");
+            let file = Command::new("git")
+                .current_dir(manifest_dir)
+                .args(["show", object.as_str()])
+                .output()
+                .expect("git must be available to inspect Pi extension history");
+            if !file.status.success() {
+                // A revision that deletes the file is not an installable stock
+                // extension revision.
+                continue;
+            }
+
+            let content = String::from_utf8(file.stdout)
+                .expect("Pi extension history must contain UTF-8 source");
+            let hash = integrity::compute_hash_bytes(
+                normalize_pi_plugin_line_endings(&content)
+                    .trim_end()
+                    .as_bytes(),
+            );
+            assert!(
+                KNOWN_PI_PLUGIN_HASHES.contains(&hash.as_str()),
+                "Pi extension revision {commit} has unallowlisted hash {hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtk_pi_plugin_marker_tracks_code_not_comments() {
+        let code_without_comments: String = PI_PLUGIN
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(looks_like_rtk_pi_plugin(&code_without_comments));
+        assert!(looks_like_rtk_pi_plugin(
+            "import { exec } from 'pi';\nexec(\"rtk\", [\"rewrite\", cmd]);\n"
+        ));
+        assert!(!looks_like_rtk_pi_plugin("const note = 'rtk rewrite';\n"));
+    }
+
+    // ─── OMP tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_omp_extension_path_for_scope_local() {
+        let path = omp_extension_path_for_scope(false).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(OMP_LOCAL_DIR)
+                .join(PI_EXTENSIONS_SUBDIR)
+                .join(PI_PLUGIN_FILE)
+        );
+    }
+
+    #[test]
+    fn test_omp_extension_path_for_scope_global_honours_pi_dir_override() {
+        let tmp = TempDir::new().unwrap();
+        with_omp_dir_override(&tmp, |omp_dir| {
+            let path = omp_extension_path_for_scope(true).unwrap();
+            assert_eq!(
+                path,
+                omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE)
+            );
+        });
+    }
+
+    #[test]
+    fn test_omp_global_install_and_uninstall_use_override() {
+        let tmp = TempDir::new().unwrap();
+        with_omp_dir_override(&tmp, |omp_dir| {
+            run_omp_mode(true, InitContext::default()).unwrap();
+
+            let plugin = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
+            assert!(plugin.exists(), "global OMP extension must be created");
+            let state_path = shared_agent_state_path(&plugin);
+            assert_eq!(
+                fs::read_to_string(&state_path).unwrap(),
+                "omp\n",
+                "OMP install must record its ownership"
+            );
+
+            uninstall_with_patch_mode(
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                PatchMode::Auto,
+                InitContext::default(),
+            )
+            .unwrap();
+            assert!(!plugin.exists(), "global OMP extension must be removed");
+            assert!(!state_path.exists(), "ownership state must be removed");
+        });
+    }
+
+    #[test]
+    fn test_global_uninstall_detects_shared_pi_omp_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        with_omp_dir_override(&tmp, |omp_dir| {
+            let omp_path = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
+            let pi_path = pi_plugin_path_for_scope(true).unwrap();
+            assert_eq!(pi_path, omp_path);
+            fs::create_dir_all(omp_path.parent().unwrap()).unwrap();
+            fs::write(&omp_path, PI_PLUGIN).unwrap();
+            record_managed_agent(
+                true,
+                &omp_path,
+                PiCompatibleAgent::Pi,
+                false,
+                InitContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                extension_share_status(true, &omp_path, PiCompatibleAgent::Omp).unwrap(),
+                ExtensionShareStatus::Shared
+            );
+
+            fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
+            assert!(
+                extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap()
+                    == ExtensionShareStatus::NotShared,
+                "a definitive Pi-only sidecar must override an unrelated project-local OMP directory"
+            );
+
+            record_managed_agent(
+                true,
+                &omp_path,
+                PiCompatibleAgent::Omp,
+                true,
+                InitContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
+                ExtensionShareStatus::Shared
+            );
+        });
+        std::env::set_current_dir(&cwd).unwrap();
+    }
+
+    #[test]
+    fn test_omp_local_install_writes_shared_pi_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), PI_PLUGIN.trim());
+    }
+
+    #[test]
+    fn test_omp_install_refuses_modified_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_omp_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("was not changed"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
+    }
+
+    #[test]
+    fn test_omp_install_dry_run_reports_refusal_without_error() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_omp_mode(
+            false,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
+    }
+
+    #[test]
+    fn test_omp_local_install_dry_run_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(
+            false,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(!path.exists());
+        assert!(!tmp.path().join(OMP_LOCAL_DIR).exists());
+    }
+
+    #[test]
+    fn test_omp_local_uninstall_removes_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_omp_local_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        let plugin = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(
+            plugin.exists(),
+            "plugin must exist before uninstall dry-run"
+        );
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(
+            plugin.exists(),
+            "dry-run uninstall must not remove the local OMP extension"
+        );
+    }
+
+    #[test]
+    fn test_omp_uninstall_modified_extension_bails() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// user-modified extension\nexport default (pi) => { pi.exec(\"rtk\", [\"rewrite\", cmd]) }\n",
+        )
+        .unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the stock extension"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(path.exists(), "modified extension must not be removed");
+    }
+
+    #[test]
+    fn test_omp_uninstall_modified_extension_dry_run_is_preview() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// user-modified extension\nexport default (pi) => { pi.exec(\"rtk\", [\"rewrite\", cmd]) }\n",
+        )
+        .unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "dry-run must preserve modified extension");
+    }
+
+    #[test]
+    fn test_omp_uninstall_unreadable_extension_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not be read; leaving it alone"),
+            "unreadable extension uninstall should fail clearly: {err}"
+        );
+        assert!(path.exists(), "unreadable extension must be left alone");
+    }
+
+    #[test]
+    fn test_omp_uninstall_unrelated_content_dry_run_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// rtk rewrite is mentioned here\nexport default () => {}\n",
+        )
+        .unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(path.exists(), "non-RTK extension must be left in place");
+    }
+
+    #[test]
+    fn test_omp_uninstall_missing_dry_run_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
     }
 
     // ─── Copilot tests ───────────────────────────────────────────────
@@ -7524,25 +9726,23 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_hook_json_serves_both_vscode_and_cli_schemas() {
+    fn test_copilot_hook_json_serves_single_pascalcase_schema() {
         let v: serde_json::Value = serde_json::from_str(COPILOT_HOOK_JSON).unwrap();
 
         let vscode = &v["hooks"]["PreToolUse"][0];
         assert_eq!(vscode["command"], "rtk hook copilot");
         assert!(vscode["timeout"].is_number(), "VS Code uses `timeout`");
+        assert_eq!(v["version"], 1);
 
-        assert_eq!(v["version"], 1, "Copilot CLI requires top-level version");
-        let cli = &v["hooks"]["preToolUse"][0];
-        assert_eq!(cli["bash"], "rtk hook copilot");
-        assert_eq!(cli["powershell"], "rtk hook copilot");
         assert!(
-            cli["timeoutSec"].is_number(),
-            "Copilot CLI uses `timeoutSec`"
+            v["hooks"].get("preToolUse").is_none(),
+            "must not register a second, redundant camelCase hook — Copilot CLI treats \
+             PreToolUse and preToolUse as independent hooks and runs both sequentially"
         );
     }
 
     #[test]
-    fn test_copilot_init_writes_dual_schema_to_disk() {
+    fn test_copilot_init_writes_single_schema_to_disk() {
         let temp = TempDir::new().unwrap();
         run_copilot_at(temp.path(), InitContext::default()).unwrap();
 
@@ -7556,7 +9756,44 @@ mod tests {
 
         assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
         assert_eq!(v["version"], 1);
-        assert_eq!(v["hooks"]["preToolUse"][0]["bash"], "rtk hook copilot");
+        assert!(v["hooks"].get("preToolUse").is_none());
+    }
+
+    #[test]
+    fn test_copilot_init_upgrades_old_dual_schema_install() {
+        // Simulates a pre-existing install from before this fix, which wrote
+        // both a PascalCase PreToolUse and a camelCase preToolUse entry.
+        // Re-running `rtk init --copilot` must overwrite it with the current
+        // single-schema config, not leave the stale camelCase entry in place.
+        let old_dual_schema_json = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      { "type": "command", "command": "rtk hook copilot", "cwd": ".", "timeout": 5 }
+    ],
+    "preToolUse": [
+      { "type": "command", "bash": "rtk hook copilot", "powershell": "rtk hook copilot", "cwd": ".", "timeoutSec": 5 }
+    ]
+  }
+}
+"#;
+
+        let temp = TempDir::new().unwrap();
+        let hooks_dir = temp.path().join(".github").join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("rtk-rewrite.json");
+        fs::write(&hook_path, old_dual_schema_json).unwrap();
+
+        run_copilot_at(temp.path(), InitContext::default()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert!(
+            v["hooks"].get("preToolUse").is_none(),
+            "re-running init must upgrade an old dual-schema install, dropping the \
+             redundant camelCase preToolUse entry"
+        );
     }
 
     #[test]
@@ -7684,7 +9921,39 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
-        assert_eq!(v["hooks"]["preToolUse"][0]["bash"], "rtk hook copilot");
+        assert!(v["hooks"].get("preToolUse").is_none());
+    }
+
+    #[test]
+    fn test_copilot_global_install_upgrades_old_dual_schema_install() {
+        let old_dual_schema_json = r#"{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      { "type": "command", "command": "rtk hook copilot", "cwd": ".", "timeout": 5 }
+    ],
+    "preToolUse": [
+      { "type": "command", "bash": "rtk hook copilot", "powershell": "rtk hook copilot", "cwd": ".", "timeoutSec": 5 }
+    ]
+  }
+}
+"#;
+
+        let temp = TempDir::new().unwrap();
+        let hooks_dir = temp.path().join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("rtk-rewrite.json");
+        fs::write(&hook_path, old_dual_schema_json).unwrap();
+
+        run_copilot_global_at(temp.path(), InitContext::default()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert!(
+            v["hooks"].get("preToolUse").is_none(),
+            "re-running global init must upgrade an old dual-schema install"
+        );
     }
 
     #[test]
@@ -7836,5 +10105,136 @@ mod tests {
             "Hook config must not be written when the upsert aborts: {}",
             hook_path.display()
         );
+    }
+
+    // ── Vibe tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_vibe_detects_rtk_entry_by_name_field() {
+        assert!(!vibe_hooks_toml_has_rtk(""));
+        assert!(!vibe_hooks_toml_has_rtk("[[hooks]]\nname = \"other\"\n"));
+        assert!(vibe_hooks_toml_has_rtk(
+            "[[hooks]]\nname = \"rtk-rewrite\"\n"
+        ));
+    }
+
+    #[test]
+    fn test_vibe_hook_entry_shape_matches_docs() {
+        let entry = vibe_hook_entry();
+        assert!(entry.contains("[[hooks]]"));
+        assert!(entry.contains(r#"name = "rtk-rewrite""#));
+        assert!(entry.contains(r#"type = "pre_tool""#));
+        assert!(entry.contains(r#"match = "bash""#));
+        assert!(entry.contains(r#"command = "rtk hook vibe""#));
+        assert!(entry.contains("strict = false"));
+    }
+
+    #[test]
+    fn test_vibe_strip_returns_none_when_entry_absent() {
+        let content = "[[hooks]]\nname = \"other\"\ntype = \"post_tool\"\n";
+        assert!(strip_vibe_rtk_entry(content).is_none());
+    }
+
+    #[test]
+    fn test_vibe_strip_removes_only_rtk_entry() {
+        let content = "[[hooks]]\nname = \"user-audit\"\ntype = \"post_tool\"\nmatch = \"*\"\ncommand = \"audit.py\"\n\n[[hooks]]\nname = \"rtk-rewrite\"\ntype = \"pre_tool\"\nmatch = \"bash\"\ncommand = \"rtk hook vibe\"\n";
+        let stripped = strip_vibe_rtk_entry(content).expect("expected removal");
+        assert!(stripped.contains(r#"name = "user-audit""#));
+        assert!(!stripped.contains(r#"name = "rtk-rewrite""#));
+        assert!(!stripped.contains("rtk hook vibe"));
+    }
+
+    #[test]
+    fn test_vibe_install_creates_hook_and_prompt() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+
+        let hooks_content = fs::read_to_string(vibe_dir.join(VIBE_HOOKS_FILE)).unwrap();
+        assert!(hooks_content.contains(r#"name = "rtk-rewrite""#));
+        assert!(hooks_content.contains(r#"command = "rtk hook vibe""#));
+
+        let prompt_path = vibe_dir.join(VIBE_PROMPTS_SUBDIR).join(VIBE_PROMPT_FILE);
+        assert!(prompt_path.exists());
+    }
+
+    #[test]
+    fn test_vibe_install_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+
+        let hooks_content = fs::read_to_string(vibe_dir.join(VIBE_HOOKS_FILE)).unwrap();
+        assert_eq!(hooks_content.matches("rtk-rewrite").count(), 1);
+    }
+
+    #[test]
+    fn test_vibe_install_preserves_existing_user_hook() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        fs::create_dir_all(&vibe_dir).unwrap();
+        let user_hook = "[[hooks]]\nname = \"user-audit\"\ntype = \"post_tool\"\nmatch = \"*\"\ncommand = \"audit.py\"\n";
+        fs::write(vibe_dir.join(VIBE_HOOKS_FILE), user_hook).unwrap();
+
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+
+        let hooks_content = fs::read_to_string(vibe_dir.join(VIBE_HOOKS_FILE)).unwrap();
+        assert!(hooks_content.contains(r#"name = "user-audit""#));
+        assert!(hooks_content.contains(r#"name = "rtk-rewrite""#));
+    }
+
+    #[test]
+    fn test_vibe_hook_only_skips_prompt_file() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        run_vibe_mode_at(&vibe_dir, true, PatchMode::Auto, InitContext::default()).unwrap();
+
+        assert!(vibe_dir.join(VIBE_HOOKS_FILE).exists());
+        assert!(!vibe_dir
+            .join(VIBE_PROMPTS_SUBDIR)
+            .join(VIBE_PROMPT_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn test_vibe_uninstall_removes_only_rtk_entry_and_prompt() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        fs::create_dir_all(&vibe_dir).unwrap();
+        let user_hook = "[[hooks]]\nname = \"user-audit\"\ntype = \"post_tool\"\nmatch = \"*\"\ncommand = \"audit.py\"\n";
+        fs::write(vibe_dir.join(VIBE_HOOKS_FILE), user_hook).unwrap();
+
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+        assert!(vibe_dir
+            .join(VIBE_PROMPTS_SUBDIR)
+            .join(VIBE_PROMPT_FILE)
+            .exists());
+
+        let removed_first = uninstall_vibe_at(&vibe_dir, InitContext::default()).unwrap();
+        let removed_second = uninstall_vibe_at(&vibe_dir, InitContext::default()).unwrap();
+
+        assert_eq!(removed_first.len(), 2);
+        assert!(removed_second.is_empty());
+        assert!(!vibe_dir
+            .join(VIBE_PROMPTS_SUBDIR)
+            .join(VIBE_PROMPT_FILE)
+            .exists());
+
+        let remaining = fs::read_to_string(vibe_dir.join(VIBE_HOOKS_FILE)).unwrap();
+        assert!(remaining.contains(r#"name = "user-audit""#));
+        assert!(!remaining.contains(r#"name = "rtk-rewrite""#));
+    }
+
+    #[test]
+    fn test_vibe_uninstall_removes_hooks_file_when_no_other_hooks() {
+        let temp = TempDir::new().unwrap();
+        let vibe_dir = temp.path().join(".vibe");
+        run_vibe_mode_at(&vibe_dir, false, PatchMode::Auto, InitContext::default()).unwrap();
+        assert!(vibe_dir.join(VIBE_HOOKS_FILE).exists());
+
+        uninstall_vibe_at(&vibe_dir, InitContext::default()).unwrap();
+
+        assert!(!vibe_dir.join(VIBE_HOOKS_FILE).exists());
     }
 }

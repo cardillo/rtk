@@ -1,7 +1,24 @@
 use crate::core::tracking;
 use crate::core::utils::{resolved_command, strip_ansi};
 use anyhow::{Context, Result};
+use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+// file:line:col: severity: message [-Wflag]
+static DIAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([^:\n]+):(\d+):\d+:\s*(error|warning|note):\s+(.+?)(?:\s+\[(-\S+)\])?$")
+        .unwrap()
+});
+
+// "In file included from …" / "In function 'foo':" / "At top level:"
+static CONTEXT_HDR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:In file included from|In function|At top level|from)\b").unwrap()
+});
+
+// make: *** [...] Error N
+static MAKE_ERR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^make(?:\[\d+\])?: \*\*\*").unwrap());
 
 pub fn run(compiler: &str, args: &[String], verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
@@ -75,23 +92,6 @@ struct GccDiagnostic {
 ///
 /// Returns a compact summary: header + grouped file sections.
 pub fn filter_gcc_output(output: &str) -> String {
-    lazy_static::lazy_static! {
-        // file:line:col: severity: message [-Wflag]
-        static ref DIAG: regex::Regex = regex::Regex::new(
-            r"^([^:\n]+):(\d+):\d+:\s*(error|warning|note):\s+(.+?)(?:\s+\[(-\S+)\])?$"
-        ).unwrap();
-
-        // "In file included from …" / "In function 'foo':" / "At top level:"
-        static ref CONTEXT_HDR: regex::Regex = regex::Regex::new(
-            r"^(?:In file included from|In function|At top level|from)\b"
-        ).unwrap();
-
-        // make: *** [...] Error N
-        static ref MAKE_ERR: regex::Regex = regex::Regex::new(
-            r"^make(?:\[\d+\])?: \*\*\*"
-        ).unwrap();
-    }
-
     let lines: Vec<&str> = output.lines().collect();
     let mut diagnostics: Vec<GccDiagnostic> = Vec::new();
     let mut make_errors: Vec<String> = Vec::new();
